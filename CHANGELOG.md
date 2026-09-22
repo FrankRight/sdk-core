@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.2 - 2026-09-22
+
+### Added
+
+- Opt-in external-worker mTLS with durable authentication selection and certificate-bound workload tokens. Existing bearer workers retain their default behavior.
+- Persist renewal request identity and replacement key before sending a request, so a lost response can be recovered after restart without enrolling another worker.
+- Trust runtime and control-plane server certificates through system roots or `AGNT5_WORKER_SERVER_CA_FILE`, independently of the workload certificate issuer.
+
+### Upgrade
+
+- Commission the policy-aware control plane, recoverable renewal endpoint, and dedicated runtime mTLS listener before enabling `AGNT5_WORKER_MTLS_ENABLED=true`. Mount a private persistent `AGNT5_WORKER_SESSION_DIR`. Once selected, mTLS remains pinned across restart and cannot silently downgrade to bearer authentication.
+
 ## 0.3.1 - 2026-09-13
 
 ### Fixed

@@ -66,23 +66,7 @@ fn default_external_worker_auth_profile() -> String {
 }
 
 fn external_worker_ca_bundle() -> Result<Option<Vec<u8>>> {
-    let path = match std::env::var("SSL_CERT_FILE") {
-        Ok(path) if !path.trim().is_empty() => path,
-        _ => return Ok(None),
-    };
-    let pem = std::fs::read(&path).map_err(|error| SdkError::Connection {
-        message: format!("read external worker CA bundle {}: {}", path, error),
-        code: crate::error::ErrorCode::ConnectionFailed,
-        source: None,
-    })?;
-    if pem.is_empty() {
-        return Err(SdkError::Connection {
-            message: format!("external worker CA bundle {} is empty", path),
-            code: crate::error::ErrorCode::ConnectionFailed,
-            source: None,
-        });
-    }
-    Ok(Some(pem))
+    crate::external_worker_identity::server_ca_pem()
 }
 
 fn configure_channel_tls(
@@ -158,6 +142,7 @@ async fn external_worker_bootstrap() -> Result<(
         .unwrap_or_else(|_| "https://api.agnt5.com".to_string())
         .trim_end_matches('/')
         .to_string();
+    crate::external_worker_identity::validate_identity_endpoint(&control_plane_url)?;
     let key_path = std::env::var("AGNT5_API_KEY_FILE").map_err(|_| SdkError::Connection {
         message: "AGNT5_API_KEY_FILE is required for external workers".to_string(),
         code: crate::error::ErrorCode::ConnectionFailed,
@@ -180,29 +165,16 @@ async fn external_worker_bootstrap() -> Result<(
     }
     let environment = std::env::var("AGNT5_ENVIRONMENT").unwrap_or_default();
     let ca_bundle = external_worker_ca_bundle()?;
-    let mut http_builder = reqwest::Client::builder().timeout(Duration::from_secs(15));
-    if let Some(pem) = ca_bundle.as_deref() {
-        let certificates =
-            reqwest::Certificate::from_pem_bundle(pem).map_err(|error| SdkError::Connection {
-                message: format!("parse external worker CA bundle: {}", error),
-                code: crate::error::ErrorCode::ConnectionFailed,
-                source: None,
-            })?;
-        for certificate in certificates {
-            http_builder = http_builder.add_root_certificate(certificate);
-        }
-    }
-    let http = http_builder.build().map_err(|error| SdkError::Connection {
-        message: format!("create external worker bootstrap client: {}", error),
-        code: crate::error::ErrorCode::ConnectionFailed,
-        source: None,
-    })?;
+    let http = crate::external_worker_identity::bootstrap_http_client()?;
+    let rollout = crate::external_worker_identity::RolloutReadiness::from_env()?;
     let response = http
         .post(format!("{}{}", control_plane_url, EXTERNAL_DISCOVERY_PATH))
         .header("X-API-KEY", &credential)
         .json(&serde_json::json!({
             "environment": environment,
-            "supported_auth_profiles": [AUTH_PROFILE_BOOTSTRAP_MTLS, AUTH_PROFILE_TOKEN_AUTH]
+            "supported_auth_profiles": rollout.profiles(),
+            "mtls_ready": rollout.ready,
+            "current_auth_profile": rollout.current_profile()
         }))
         .send()
         .await
@@ -234,6 +206,7 @@ async fn external_worker_bootstrap() -> Result<(
             source: None,
         });
     }
+    rollout.accept(&authority.auth_profile)?;
     match authority.auth_profile.as_str() {
         AUTH_PROFILE_BOOTSTRAP_MTLS => {
             if authority.identity_endpoint.trim().is_empty() {

@@ -49,6 +49,7 @@ struct OpenRequest<'a> {
 
 #[derive(Debug, Serialize)]
 struct RenewRequest<'a> {
+    request_id: &'a str,
     csr_der_base64: &'a str,
 }
 
@@ -74,6 +75,15 @@ struct Session {
     token_expires_at: DateTime<Utc>,
     #[serde(default)]
     private_key_pem: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_renewal: Option<PendingRenewal>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PendingRenewal {
+    request_id: String,
+    private_key_pem: String,
+    csr_der_base64: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -157,17 +167,19 @@ impl IdentityManager {
             .get_or_init(|| Mutex::new(()))
             .lock()
             .await;
-        let session = match load_session(&session_path, &authority) {
-            Ok(session) => session,
-            Err(_) => {
-                let (key, csr) = new_key_and_csr()?;
-                let mut session =
-                    open_session(&control_plane_url, &credential, &authority, &csr).await?;
-                session.private_key_pem = key;
-                validate_session(&session, &authority)?;
-                write_session(&session_path, &session)?;
-                session
-            }
+        let session = if session_path
+            .try_exists()
+            .map_err(|_| connection_error("cannot inspect worker session file"))?
+        {
+            load_session(&session_path, &authority)?
+        } else {
+            let (key, csr) = new_key_and_csr()?;
+            let mut session =
+                open_session(&control_plane_url, &credential, &authority, &csr).await?;
+            session.private_key_pem = key;
+            validate_session(&session, &authority)?;
+            write_session(&session_path, &session)?;
+            session
         };
         let readiness = IdentityReadiness::Ready {
             certificate_expires_at: session.certificate_expires_at,
@@ -181,6 +193,16 @@ impl IdentityManager {
             readiness: RwLock::new(readiness),
             subscribers: Mutex::new(Vec::new()),
         };
+        let current = manager
+            .session
+            .read()
+            .map_err(|_| connection_error("worker identity state unavailable"))?
+            .clone();
+        if current.pending_renewal.is_some() || Utc::now() >= current.renew_after {
+            manager.renew(&current).await?;
+        } else if current.token_expires_at <= Utc::now() + REFRESH_MARGIN {
+            manager.refresh(&current).await?;
+        }
         Ok(manager)
     }
 
@@ -217,7 +239,7 @@ impl IdentityManager {
                 Err(_) => continue,
             };
             let now = Utc::now();
-            let result = if now >= session.renew_after {
+            let result = if session.pending_renewal.is_some() || now >= session.renew_after {
                 self.renew(&session).await
             } else if now + REFRESH_MARGIN >= session.token_expires_at {
                 self.refresh(&session).await
@@ -278,13 +300,31 @@ impl IdentityManager {
     }
 
     async fn renew(&self, current: &Session) -> Result<()> {
-        let (private_key_pem, csr) = new_key_and_csr()?;
+        let mut pending_session = current.clone();
+        if pending_session.pending_renewal.is_none() {
+            let (private_key_pem, csr_der_base64) = new_key_and_csr()?;
+            pending_session.pending_renewal = Some(PendingRenewal {
+                request_id: uuid::Uuid::new_v4().to_string(),
+                private_key_pem,
+                csr_der_base64,
+            });
+            // Commit intent before the network call. A lost response or restart
+            // must resend the same CSR and retain its private key.
+            write_session(&self.session_path, &pending_session)?;
+            *self
+                .session
+                .write()
+                .map_err(|_| connection_error("worker identity state unavailable"))? =
+                pending_session.clone();
+        }
+        let pending = pending_session.pending_renewal.as_ref().unwrap();
         let client = identity_http_client(current)?;
         let response = client
             .post(format!("{}{}", self.identity_url, SESSION_RENEW_PATH))
             .bearer_auth(&current.workload_token)
             .json(&RenewRequest {
-                csr_der_base64: &csr,
+                request_id: &pending.request_id,
+                csr_der_base64: &pending.csr_der_base64,
             })
             .send()
             .await
@@ -299,7 +339,8 @@ impl IdentityManager {
             .json()
             .await
             .map_err(|e| connection_error(format!("decode worker identity renewal: {e}")))?;
-        next.private_key_pem = private_key_pem;
+        next.private_key_pem = pending.private_key_pem.clone();
+        next.pending_renewal = None;
         if next.runtime_endpoint.trim().is_empty() {
             next.runtime_endpoint = current.runtime_endpoint.clone();
         }
@@ -373,39 +414,72 @@ async fn open_session(
         .map_err(|e| connection_error(format!("decode worker identity enrollment: {e}")))
 }
 
-fn bootstrap_http_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .redirect(reqwest::redirect::Policy::none())
+pub(crate) fn bootstrap_http_client() -> Result<reqwest::Client> {
+    server_http_builder()?
         .build()
         .map_err(|e| connection_error(format!("create worker enrollment client: {e}")))
+}
+
+pub(crate) fn server_ca_pem() -> Result<Option<Vec<u8>>> {
+    match std::env::var("AGNT5_WORKER_SERVER_CA_FILE").or_else(|e| {
+        if matches!(e, std::env::VarError::NotPresent) {
+            std::env::var("SSL_CERT_FILE")
+        } else {
+            Err(e)
+        }
+    }) {
+        Ok(path) if !path.trim().is_empty() => {
+            let bytes = std::fs::read(path.trim())
+                .map_err(|_| connection_error("cannot read AGNT5_WORKER_SERVER_CA_FILE"))?;
+            if bytes.is_empty() {
+                return Err(connection_error("worker server CA file is empty"));
+            }
+            Ok(Some(bytes))
+        }
+        Ok(_) | Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(_) => Err(connection_error("worker server CA file path must be UTF-8")),
+    }
+}
+
+fn server_http_builder() -> Result<reqwest::ClientBuilder> {
+    let mut builder = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none());
+    if let Some(pem) = server_ca_pem()? {
+        let roots = reqwest::Certificate::from_pem_bundle(&pem)
+            .map_err(|_| connection_error("invalid worker server CA PEM"))?;
+        if roots.is_empty() {
+            return Err(connection_error(
+                "worker server CA file contains no certificates",
+            ));
+        }
+        for root in roots {
+            builder = builder.add_root_certificate(root);
+        }
+    }
+    Ok(builder)
 }
 
 fn identity_http_client(session: &Session) -> Result<reqwest::Client> {
     let identity = reqwest::Identity::from_pem(&identity_pem(session)?)
         .map_err(|e| connection_error(format!("load worker client identity: {e}")))?;
-    let mut builder = reqwest::Client::builder()
+    server_http_builder()?
         .identity(identity)
-        .timeout(Duration::from_secs(15))
-        .redirect(reqwest::redirect::Policy::none());
-    for root in trust_bundle_pem(session)? {
-        builder = builder.add_root_certificate(
-            reqwest::Certificate::from_pem(root.as_bytes())
-                .map_err(|e| connection_error(format!("load worker trust root: {e}")))?,
-        );
-    }
-    builder
         .build()
         .map_err(|e| connection_error(format!("create worker mTLS client: {e}")))
 }
 
 fn tls_config(session: &Session) -> Result<ClientTlsConfig> {
-    Ok(ClientTlsConfig::new()
+    let mut tls = ClientTlsConfig::new()
+        .with_webpki_roots()
         .identity(Identity::from_pem(
             certificate_chain_pem(session)?,
             session.private_key_pem.clone(),
-        ))
-        .ca_certificate(Certificate::from_pem(trust_bundle_pem(session)?.concat())))
+        ));
+    if let Some(pem) = server_ca_pem()? {
+        tls = tls.ca_certificate(Certificate::from_pem(pem));
+    }
+    Ok(tls)
 }
 
 fn identity_pem(session: &Session) -> Result<Vec<u8>> {
@@ -424,14 +498,6 @@ fn certificate_chain_pem(session: &Session) -> Result<String> {
             .map(String::as_str),
     );
     der_values_to_pem("CERTIFICATE", values)
-}
-
-fn trust_bundle_pem(session: &Session) -> Result<Vec<String>> {
-    session
-        .trust_bundle_der_base64
-        .iter()
-        .map(|value| der_values_to_pem("CERTIFICATE", [value.as_str()]))
-        .collect()
 }
 
 fn der_values_to_pem<'a>(label: &str, values: impl IntoIterator<Item = &'a str>) -> Result<String> {
@@ -458,6 +524,14 @@ fn new_key_and_csr() -> Result<(String, String)> {
 }
 
 fn validate_session(session: &Session, authority: &Authority) -> Result<()> {
+    validate_session_material(session, authority)?;
+    if session.token_expires_at <= Utc::now() + ChronoDuration::seconds(30) {
+        return Err(connection_error("worker token requires refresh"));
+    }
+    Ok(())
+}
+
+fn validate_session_material(session: &Session, authority: &Authority) -> Result<()> {
     if session.project_id != authority.project_id
         || session.environment_id != authority.environment_id
         || session.deployment_id != authority.deployment_id
@@ -469,7 +543,6 @@ fn validate_session(session: &Session, authority: &Authority) -> Result<()> {
         || session.certificate_der_base64.trim().is_empty()
         || session.trust_bundle_der_base64.is_empty()
         || session.certificate_expires_at <= Utc::now() + ChronoDuration::seconds(30)
-        || session.token_expires_at <= Utc::now() + ChronoDuration::seconds(30)
     {
         return Err(connection_error(
             "stored worker identity is expired, incomplete, or outside discovery authority",
@@ -478,13 +551,137 @@ fn validate_session(session: &Session, authority: &Authority) -> Result<()> {
     Ok(())
 }
 
+const AUTH_PROFILE_FILE: &str = "worker-auth-profile";
+
+pub(crate) struct RolloutReadiness {
+    pub(crate) ready: bool,
+    pub(crate) pinned: bool,
+    directory: PathBuf,
+}
+
+impl RolloutReadiness {
+    pub(crate) fn from_env() -> Result<Self> {
+        Self::prepare(
+            &std::env::var("AGNT5_WORKER_MTLS_ENABLED").unwrap_or_default(),
+            &std::env::var("AGNT5_WORKER_SESSION_DIR").unwrap_or_default(),
+        )
+    }
+
+    fn prepare(enabled: &str, directory: &str) -> Result<Self> {
+        let opted_in = match enabled.trim() {
+            "" | "false" => false,
+            "true" => true,
+            _ => {
+                return Err(connection_error(
+                    "AGNT5_WORKER_MTLS_ENABLED must be true or false",
+                ))
+            }
+        };
+        let directory = PathBuf::from(directory.trim());
+        let mut pinned = false;
+        if !directory.as_os_str().is_empty() {
+            for name in [AUTH_PROFILE_FILE, SESSION_FILE_NAME] {
+                let path = directory.join(name);
+                match std::fs::symlink_metadata(&path) {
+                    Ok(_) => {
+                        ensure_private_session_file(&path)?;
+                        if name == AUTH_PROFILE_FILE {
+                            let value = std::fs::read_to_string(&path).map_err(|e| {
+                                connection_error(format!("read worker auth profile: {e}"))
+                            })?;
+                            if value != "bootstrap-mtls" {
+                                return Err(connection_error(
+                                    "invalid persisted worker auth profile",
+                                ));
+                            }
+                        }
+                        pinned = true;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        return Err(connection_error(format!(
+                            "inspect worker identity state: {e}"
+                        )))
+                    }
+                }
+            }
+        }
+        let ready = opted_in || pinned;
+        if ready {
+            if directory.as_os_str().is_empty() {
+                return Err(connection_error(
+                    "AGNT5_WORKER_SESSION_DIR is required for mTLS readiness",
+                ));
+            }
+            ensure_private_directory(&directory)?;
+            let probe = directory.join(format!(".worker-readiness-{}", uuid::Uuid::new_v4()));
+            write_private_file(&probe, b"")?;
+            std::fs::remove_file(probe)
+                .map_err(|e| connection_error(format!("remove worker readiness probe: {e}")))?;
+        }
+        Ok(Self {
+            ready,
+            pinned,
+            directory,
+        })
+    }
+
+    pub(crate) fn profiles(&self) -> Vec<&'static str> {
+        if self.pinned {
+            vec!["bootstrap-mtls"]
+        } else if self.ready {
+            vec!["bootstrap-mtls", "token-auth"]
+        } else {
+            vec!["token-auth"]
+        }
+    }
+
+    pub(crate) fn current_profile(&self) -> &'static str {
+        if self.pinned {
+            "bootstrap-mtls"
+        } else {
+            ""
+        }
+    }
+
+    pub(crate) fn accept(&self, profile: &str) -> Result<()> {
+        if profile == "token-auth" {
+            return if self.pinned {
+                Err(connection_error(
+                    "refusing to downgrade an enrolled mTLS worker to token-auth",
+                ))
+            } else {
+                Ok(())
+            };
+        }
+        if profile != "bootstrap-mtls" || !self.ready {
+            return Err(connection_error(
+                "discovery selected an authentication profile the worker is not ready to use",
+            ));
+        }
+        // Persist selection before enrollment so retries and process restarts
+        // cannot turn a failed enrollment into an implicit bearer fallback.
+        let temporary = self
+            .directory
+            .join(format!(".worker-auth-profile-{}", uuid::Uuid::new_v4()));
+        write_private_file(&temporary, b"bootstrap-mtls")?;
+        if let Err(error) = std::fs::rename(&temporary, self.directory.join(AUTH_PROFILE_FILE)) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(connection_error(format!(
+                "persist worker auth profile: {error}"
+            )));
+        }
+        sync_directory(&self.directory)
+    }
+}
+
 fn load_session(path: &Path, authority: &Authority) -> Result<Session> {
     ensure_private_session_file(path)?;
     let bytes = std::fs::read(path)
         .map_err(|e| connection_error(format!("load worker session {}: {e}", path.display())))?;
     let session: Session = serde_json::from_slice(&bytes)
         .map_err(|e| connection_error(format!("decode worker session: {e}")))?;
-    validate_session(&session, authority)?;
+    validate_session_material(&session, authority)?;
     Ok(session)
 }
 
@@ -576,15 +773,24 @@ fn bearer_metadata(token: &str) -> Result<MetadataValue<tonic::metadata::Ascii>>
         .map_err(|_| connection_error("worker token cannot be encoded as authorization metadata"))
 }
 
-fn validate_identity_endpoint(value: &str) -> Result<()> {
+pub(crate) fn validate_identity_endpoint(value: &str) -> Result<()> {
     let parsed = reqwest::Url::parse(value)
         .map_err(|e| connection_error(format!("invalid discovered identity endpoint: {e}")))?;
-    if parsed.scheme() != "https"
-        && !matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "::1"))
+    let loopback = parsed.host_str().is_some_and(|host| {
+        host == "localhost"
+            || host
+                .trim_matches(['[', ']'])
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    });
+    if !(parsed.scheme() == "https" || parsed.scheme() == "http" && loopback)
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
     {
-        return Err(connection_error(
-            "discovered identity endpoint must use HTTPS",
-        ));
+        return Err(connection_error("worker endpoint requires HTTPS without URL credentials, query or fragment; HTTP is loopback-only"));
     }
     Ok(())
 }
@@ -611,6 +817,37 @@ fn connection_error(message: impl Into<String>) -> SdkError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rolling_opt_in_survives_restart_and_prevents_downgrade() {
+        let legacy = RolloutReadiness::prepare("", "").unwrap();
+        assert_eq!(legacy.profiles(), vec!["token-auth"]);
+        assert!(legacy.accept("bootstrap-mtls").is_err());
+        assert!(legacy.accept("token-auth").is_ok());
+        assert!(RolloutReadiness::prepare("true", "").is_err());
+        assert!(RolloutReadiness::prepare("typo", "").is_err());
+        let dir = tempfile::tempdir().unwrap();
+        let directory = dir.path().to_str().unwrap();
+        let ready = RolloutReadiness::prepare("true", directory).unwrap();
+        assert!(ready.ready && !ready.pinned);
+        ready.accept("bootstrap-mtls").unwrap();
+        let restarted = RolloutReadiness::prepare("false", directory).unwrap();
+        assert!(restarted.ready && restarted.pinned);
+        assert_eq!(restarted.profiles(), vec!["bootstrap-mtls"]);
+        assert_eq!(restarted.current_profile(), "bootstrap-mtls");
+        assert!(restarted.accept("token-auth").is_err());
+        std::fs::write(dir.path().join(AUTH_PROFILE_FILE), b"corrupt").unwrap();
+        assert!(RolloutReadiness::prepare("", directory).is_err());
+    }
+
+    #[test]
+    fn existing_session_pins_even_without_rollout_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        write_private_file(&dir.path().join(SESSION_FILE_NAME), b"old SDK session").unwrap();
+        let ready = RolloutReadiness::prepare("", dir.path().to_str().unwrap()).unwrap();
+        assert!(ready.ready && ready.pinned);
+        assert!(ready.accept("token-auth").is_err());
+    }
 
     fn authority() -> Authority {
         Authority {
@@ -651,9 +888,127 @@ mod tests {
             token_type: "Bearer".into(),
             token_expires_at: Utc::now() + ChronoDuration::minutes(5),
             private_key_pem: "key".into(),
+            pending_renewal: None,
         };
         assert!(validate_session(&session, &authority()).is_ok());
         session.project_id = "other".into();
         assert!(validate_session(&session, &authority()).is_err());
+    }
+    #[tokio::test]
+    async fn renewal_reuses_persisted_intent_after_response_loss_and_restart() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SESSION_FILE_NAME);
+        let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let cert = CertificateParams::default().self_signed(&key).unwrap();
+        let current = Session {
+            session_id: "predecessor".into(),
+            project_id: "project".into(),
+            environment_id: "environment".into(),
+            deployment_id: "deployment".into(),
+            worker_pool_id: "pool".into(),
+            worker_id: "worker".into(),
+            spiffe_id: "spiffe://example/workload/project/environment/deployment/worker".into(),
+            runtime_endpoint: "https://runtime.example.com".into(),
+            certificate_der_base64: base64::engine::general_purpose::STANDARD.encode(cert.der()),
+            certificate_chain_der_base64: vec![],
+            trust_bundle_der_base64: vec![
+                base64::engine::general_purpose::STANDARD.encode(cert.der())
+            ],
+            trust_bundle_version: "v1".into(),
+            certificate_expires_at: Utc::now() + ChronoDuration::hours(1),
+            renew_after: Utc::now() - ChronoDuration::minutes(1),
+            workload_token: "old-token".into(),
+            token_type: "Bearer".into(),
+            token_expires_at: Utc::now() - ChronoDuration::minutes(1),
+            private_key_pem: key.serialize_pem(),
+            pending_renewal: None,
+        };
+        write_session(&path, &current).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server_path = path.clone();
+        let server = tokio::spawn(async move {
+            let mut original = None;
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let request: serde_json::Value = loop {
+                    let mut chunk = [0; 4096];
+                    let n = stream.read(&mut chunk).await.unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&chunk[..n]);
+                    assert!(bytes.len() < 64 * 1024);
+                    if let Some(header_end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let header = String::from_utf8_lossy(&bytes[..header_end]);
+                        let length: usize = header
+                            .lines()
+                            .find_map(|line| {
+                                let (k, v) = line.split_once(':')?;
+                                k.eq_ignore_ascii_case("content-length")
+                                    .then(|| v.trim().parse().unwrap())
+                            })
+                            .unwrap();
+                        if bytes.len() >= header_end + 4 + length {
+                            break serde_json::from_slice(
+                                &bytes[header_end + 4..header_end + 4 + length],
+                            )
+                            .unwrap();
+                        }
+                    }
+                };
+                let stored = load_session(&server_path, &authority()).unwrap();
+                let pending = stored
+                    .pending_renewal
+                    .as_ref()
+                    .expect("intent must predate network request");
+                assert_eq!(request["request_id"], pending.request_id);
+                assert_eq!(request["csr_der_base64"], pending.csr_der_base64);
+                let identity = (
+                    pending.request_id.clone(),
+                    pending.csr_der_base64.clone(),
+                    pending.private_key_pem.clone(),
+                );
+                if attempt == 0 {
+                    original = Some(identity);
+                    drop(stream);
+                    continue;
+                }
+                assert_eq!(original.as_ref().unwrap(), &identity);
+                let key = KeyPair::from_pem(&pending.private_key_pem).unwrap();
+                let cert = CertificateParams::default().self_signed(&key).unwrap();
+                let mut next = stored.clone();
+                next.session_id = "successor".into();
+                next.pending_renewal = None;
+                next.private_key_pem = String::new();
+                next.certificate_der_base64 =
+                    base64::engine::general_purpose::STANDARD.encode(cert.der());
+                next.token_expires_at = Utc::now() + ChronoDuration::minutes(10);
+                let body = serde_json::to_vec(&next).unwrap();
+                let header = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len());
+                stream.write_all(header.as_bytes()).await.unwrap();
+                stream.write_all(&body).await.unwrap();
+            }
+            original.unwrap().2
+        });
+        let manager = |session: Session| IdentityManager {
+            identity_url: endpoint.clone(),
+            authority: authority(),
+            session_path: path.clone(),
+            session: RwLock::new(session),
+            readiness: RwLock::new(IdentityReadiness::Degraded),
+            subscribers: Mutex::new(Vec::new()),
+        };
+        let first = manager(current.clone());
+        assert!(first.renew(&current).await.is_err());
+        drop(first);
+        let restarted_session = load_session(&path, &authority()).unwrap();
+        let restarted = manager(restarted_session.clone());
+        restarted.renew(&restarted_session).await.unwrap();
+        let original_key = server.await.unwrap();
+        let final_session = load_session(&path, &authority()).unwrap();
+        assert_eq!(final_session.session_id, "successor");
+        assert!(final_session.pending_renewal.is_none());
+        assert_eq!(final_session.private_key_pem, original_key);
     }
 }
