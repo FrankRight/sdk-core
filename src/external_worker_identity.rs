@@ -131,6 +131,8 @@ pub(crate) async fn connection_identity(
     credential: String,
     authority: Authority,
 ) -> Result<ConnectionIdentity> {
+    let expected_authority = authority.clone();
+    let expected_identity_url = identity_url.clone();
     let manager = MANAGER
         .get_or_try_init(|| async {
             IdentityManager::initialize(control_plane_url, identity_url, credential, authority)
@@ -139,6 +141,11 @@ pub(crate) async fn connection_identity(
         })
         .await?
         .clone();
+    if manager.authority != expected_authority || manager.identity_url != expected_identity_url {
+        return Err(connection_error(
+            "external worker discovery changed the process identity authority; restart with its own session directory",
+        ));
+    }
     manager.connection_identity().await
 }
 
@@ -156,12 +163,6 @@ impl IdentityManager {
         validate_identity_endpoint(&identity_url)?;
         let session_dir = PathBuf::from(required_env("AGNT5_WORKER_SESSION_DIR")?);
         ensure_private_directory(&session_dir)?;
-        // Discovery is authoritative for runtime registration. Language
-        // bindings consume these through the existing WorkerConfig path.
-        std::env::set_var("AGNT5_PROJECT_ID", &authority.project_id);
-        std::env::set_var("AGNT5_DEPLOYMENT_ID", &authority.deployment_id);
-        std::env::set_var("AGNT5_WORKERPOOL_ID", &authority.worker_pool_id);
-        std::env::set_var("AGNT5_WORKER_MODE", "pull");
         let session_path = session_dir.join(SESSION_FILE_NAME);
         let _guard = SESSION_FILE_LOCK
             .get_or_init(|| Mutex::new(()))

@@ -822,6 +822,14 @@ impl WorkerConfig {
     }
 }
 
+fn connected_worker_mode(value: Option<&str>, external_worker: bool) -> WorkerMode {
+    if external_worker {
+        WorkerMode::Pull
+    } else {
+        resolve_worker_mode(value)
+    }
+}
+
 fn resolve_worker_mode(value: Option<&str>) -> WorkerMode {
     match value {
         None | Some("") | Some("pull") | Some("PULL") => WorkerMode::Pull,
@@ -4652,7 +4660,10 @@ impl Worker {
         // `AGNT5_WORKER_MODE=pull` now means parked long-poll assignment
         // (`RegisterWorkerSession` + `PollJob`). The legacy batch `PollJobs`
         // loop is intentionally gone.
-        let mode = resolve_worker_mode(std::env::var("AGNT5_WORKER_MODE").ok().as_deref());
+        let mode = connected_worker_mode(
+            std::env::var("AGNT5_WORKER_MODE").ok().as_deref(),
+            client.is_external_worker(),
+        );
         let is_pull_mode = mode == WorkerMode::Pull;
         metadata.insert(
             "AGNT5_WORKER_MODE".to_string(),
@@ -4893,6 +4904,19 @@ impl Worker {
                 break Ok(());
             }
             tokio::select! {
+                _ = client.wait_for_identity_rotation() => {
+                    revoke_active_pull_slots(
+                        &self.slot_phases,
+                        &self.revoked_executions,
+                        &self.cancel_tokens,
+                        &self.cancel_hook,
+                    );
+                    break Err(SdkError::Connection {
+                        message: "worker certificate rotated; reconnecting with replacement identity".to_string(),
+                        code: crate::error::ErrorCode::ConnectionFailed,
+                        source: None,
+                    });
+                }
                 // Dispatch incoming messages to worker pool
                 result = rx.recv_async() => {
                     match result {
@@ -6041,6 +6065,12 @@ impl Worker {
                     return;
                 }
             };
+            // The certificate identity can replace the configured random ID.
+            // Bind the entire parked context before registration so lifecycle,
+            // activation, renewal and completion carry the same authority as
+            // PollJob. Rewriting only RPC envelopes leaves handler-emitted
+            // journal records fenced against the wrong worker.
+            let worker_id = client.effective_worker_id(&worker_id).to_string();
             let registration = ParkedWorkerSessionRegistration {
                 worker_id: worker_id.clone(),
                 project_id: project_id.clone(),
@@ -6452,6 +6482,18 @@ mod tests {
             }
             other => panic!("expected typed timeout error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn external_discovery_selects_pull_without_changing_local_worker_mode() {
+        for value in [None, Some("pull"), Some("push")] {
+            assert_eq!(super::connected_worker_mode(value, true), WorkerMode::Pull);
+        }
+        assert_eq!(
+            super::connected_worker_mode(Some("push"), false),
+            WorkerMode::Push
+        );
+        assert_eq!(super::connected_worker_mode(None, false), WorkerMode::Pull);
     }
 
     #[test]

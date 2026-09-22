@@ -270,12 +270,6 @@ async fn external_worker_bootstrap() -> Result<(
         initial.expires_at,
     );
 
-    // Discovery is authoritative. These values are consumed immediately after
-    // connect when the pull session registration is constructed.
-    std::env::set_var("AGNT5_PROJECT_ID", &bootstrap.authority.project_id);
-    std::env::set_var("AGNT5_DEPLOYMENT_ID", &bootstrap.authority.deployment_id);
-    std::env::set_var("AGNT5_WORKERPOOL_ID", &bootstrap.authority.worker_pool_id);
-    std::env::set_var("AGNT5_WORKER_MODE", "pull");
     eprintln!("[INFO] worker authenticated with token auth");
     eprintln!(
         "[INFO] discovered runtime endpoint ({})",
@@ -495,6 +489,25 @@ pub struct WorkerCoordinatorClient {
     negotiated_protocol_capabilities: Arc<RwLock<Vec<String>>>,
     authoritative_worker_id: Option<String>,
     external_worker_authority: Option<ExternalWorkerAuthority>,
+    identity_authorization: Option<Arc<RwLock<Option<MetadataValue<tonic::metadata::Ascii>>>>>,
+}
+
+async fn wait_for_identity_rotation(
+    authorization: Option<&Arc<RwLock<Option<MetadataValue<tonic::metadata::Ascii>>>>>,
+) {
+    let Some(authorization) = authorization else {
+        return std::future::pending().await;
+    };
+    loop {
+        if authorization
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_none()
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 const WORKER_COORDINATOR_RPC_TIMEOUT: Duration = Duration::from_secs(45);
@@ -556,6 +569,9 @@ impl WorkerCoordinatorClient {
 
         let client =
             WorkerCoordinatorServiceClient::with_interceptor(channel.clone(), interceptor.clone());
+        let identity_authorization = authoritative_worker_id
+            .as_ref()
+            .map(|_| interceptor.token.clone());
         let engine_client = EngineServiceClient::with_interceptor(channel, interceptor);
 
         Ok(Self {
@@ -564,7 +580,14 @@ impl WorkerCoordinatorClient {
             negotiated_protocol_capabilities: Arc::new(RwLock::new(Vec::new())),
             authoritative_worker_id,
             external_worker_authority,
+            identity_authorization,
         })
+    }
+
+    /// Rotation invalidates the old certificate-bound token. Pull workers have
+    /// no dispatch stream to close, so observe that invalidation explicitly.
+    pub(crate) async fn wait_for_identity_rotation(&self) {
+        wait_for_identity_rotation(self.identity_authorization.as_ref()).await;
     }
 
     /// Apply the project-bound authority returned by external worker discovery.
@@ -575,6 +598,10 @@ impl WorkerCoordinatorClient {
             return;
         };
         authority.apply_to_metadata(metadata);
+    }
+
+    pub(crate) fn is_external_worker(&self) -> bool {
+        self.external_worker_authority.is_some()
     }
 
     /// Use the server-assigned ID for certificate-bound customer workers.
@@ -1289,6 +1316,8 @@ pub struct EngineClient {
     clients: Vec<EngineServiceClient<AuthenticatedChannel>>,
     next: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     authoritative_worker_id: Option<String>,
+    identity_authorization: Option<Arc<RwLock<Option<MetadataValue<tonic::metadata::Ascii>>>>>,
+    endpoint: String,
 }
 
 impl EngineClient {
@@ -1360,14 +1389,28 @@ impl EngineClient {
         Ok(Self {
             clients,
             next: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            identity_authorization: authoritative_worker_id
+                .as_ref()
+                .map(|_| interceptor.token.clone()),
             authoritative_worker_id,
+            endpoint,
         })
     }
 
     /// Get the next client from the pool (round-robin).
-    fn next_client(&mut self) -> &mut EngineServiceClient<AuthenticatedChannel> {
+    async fn next_client(&mut self) -> Result<&mut EngineServiceClient<AuthenticatedChannel>> {
+        // Bindings can retain an engine client across worker reconnections.
+        // A renewed certificate needs a new TLS pool; never reuse the old
+        // channel or attach its successor's token to the old certificate.
+        if self
+            .identity_authorization
+            .as_ref()
+            .is_some_and(|token| token.read().unwrap_or_else(|p| p.into_inner()).is_none())
+        {
+            *self = Self::connect(&self.endpoint).await?;
+        }
         let idx = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.clients.len();
-        &mut self.clients[idx]
+        Ok(&mut self.clients[idx])
     }
 
     /// Admit one logical activation and return the journal-authoritative decision.
@@ -1377,7 +1420,12 @@ impl EngineClient {
     ) -> Result<BeginActivationResponse> {
         let mut timer = crate::core_metrics::RpcTimer::new(&request.run_id, "begin");
         for attempt in 0..ENGINE_ACTIVATION_RPC_ATTEMPTS {
-            match self.next_client().begin_activation(request.clone()).await {
+            match self
+                .next_client()
+                .await?
+                .begin_activation(request.clone())
+                .await
+            {
                 Ok(response) => {
                     let response = response.into_inner();
                     timer.outcome(match response.outcome {
@@ -1416,6 +1464,7 @@ impl EngineClient {
         for attempt in 0..ENGINE_ACTIVATION_RPC_ATTEMPTS {
             match self
                 .next_client()
+                .await?
                 .complete_activation(request.clone())
                 .await
             {
@@ -1456,7 +1505,12 @@ impl EngineClient {
     ) -> Result<FailActivationResponse> {
         let mut timer = crate::core_metrics::RpcTimer::new(&request.run_id, "fail");
         for attempt in 0..ENGINE_ACTIVATION_RPC_ATTEMPTS {
-            match self.next_client().fail_activation(request.clone()).await {
+            match self
+                .next_client()
+                .await?
+                .fail_activation(request.clone())
+                .await
+            {
                 Ok(response) => {
                     let response = response.into_inner();
                     timer.outcome(if response.accepted {
@@ -1490,7 +1544,12 @@ impl EngineClient {
         request: SuspendActivationRequest,
     ) -> Result<SuspendActivationResponse> {
         for attempt in 0..ENGINE_ACTIVATION_RPC_ATTEMPTS {
-            match self.next_client().suspend_activation(request.clone()).await {
+            match self
+                .next_client()
+                .await?
+                .suspend_activation(request.clone())
+                .await
+            {
                 Ok(response) => return Ok(response.into_inner()),
                 Err(status) if should_retry_activation_status(&status, attempt) => {
                     debug!(
@@ -1511,6 +1570,7 @@ impl EngineClient {
         for attempt in 0..ENGINE_RPC_RETRY_ATTEMPTS {
             match self
                 .next_client()
+                .await?
                 .append(AppendRequest {
                     record: Some(record.clone()),
                 })
@@ -1549,6 +1609,7 @@ impl EngineClient {
         for attempt in 0..ENGINE_RPC_RETRY_ATTEMPTS {
             match self
                 .next_client()
+                .await?
                 .append_batch(AppendBatchRequest {
                     records: records.clone(),
                 })
@@ -1595,6 +1656,7 @@ impl EngineClient {
         let expected = events.len() as i64;
         let response = self
             .next_client()
+            .await?
             .event_stream(tokio_stream::iter(events))
             .await
             .map_err(|status| SdkError::Connection {
@@ -1649,6 +1711,41 @@ pub fn build_engine_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn identity_rotation_wakes_connection_loop_only_after_invalidation() {
+        let token = Arc::new(RwLock::new(Some(bearer_metadata("first").unwrap())));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), wait_for_identity_rotation(None))
+                .await
+                .is_err()
+        );
+        assert!(tokio::time::timeout(
+            Duration::from_millis(10),
+            wait_for_identity_rotation(Some(&token))
+        )
+        .await
+        .is_err());
+        // Refresh on the same certificate must not restart a worker.
+        *token.write().unwrap() = Some(bearer_metadata("refreshed").unwrap());
+        assert!(tokio::time::timeout(
+            Duration::from_millis(10),
+            wait_for_identity_rotation(Some(&token))
+        )
+        .await
+        .is_err());
+        let rotated = wait_for_identity_rotation(Some(&token));
+        tokio::pin!(rotated);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut rotated)
+                .await
+                .is_err()
+        );
+        *token.write().unwrap() = None;
+        tokio::time::timeout(Duration::from_secs(1), rotated)
+            .await
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn https_channel_enables_tls_without_an_explicit_client_config() {
@@ -1775,11 +1872,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retired_engine_identity_reconnects_before_using_cached_channels() {
+        let mut client = EngineClient {
+            // If stale clients are selected, the empty pool makes this fail.
+            clients: Vec::new(),
+            next: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            authoritative_worker_id: Some("worker".into()),
+            identity_authorization: Some(Arc::new(RwLock::new(None))),
+            endpoint: "invalid endpoint".into(),
+        };
+        let error = client.next_client().await.unwrap_err();
+        assert!(error.to_string().contains("Invalid engine endpoint"));
+        assert_eq!(client.next.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
     async fn append_batch_rejects_multi_run_before_retry_or_rpc() {
         let mut client = EngineClient {
             clients: Vec::new(),
             next: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             authoritative_worker_id: None,
+            identity_authorization: None,
+            endpoint: "http://127.0.0.1:1".into(),
         };
         let records = vec![
             Record {

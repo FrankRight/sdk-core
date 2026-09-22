@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.3 - 2026-09-22
+
+### Fixed
+
+- Reconnect pull-only workers after certificate rotation, including rebuilding cached engine channels; token refresh on the same certificate does not restart the worker.
+
+- Keep discovered project/deployment authority and pull mode on the connection instead of rewriting process environment variables; reject reuse of a cached certificate manager for a different authority.
+
+- Propagate the certificate-assigned worker ID into pull execution, lifecycle checkpoints, and activation authority. This fixes `authority_stale` failures when opt-in mTLS workers execute tasks; bearer workers keep their configured ID.
+
 ## 0.3.2 - 2026-09-22
 
 ### Added
