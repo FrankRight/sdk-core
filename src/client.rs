@@ -197,12 +197,15 @@ async fn external_worker_bootstrap() -> Result<(
         code: crate::error::ErrorCode::ConnectionFailed,
         source: None,
     })?;
+    let rollout = crate::external_worker_identity::RolloutReadiness::from_env()?;
     let response = http
         .post(format!("{}{}", control_plane_url, EXTERNAL_DISCOVERY_PATH))
         .header("X-API-KEY", &credential)
         .json(&serde_json::json!({
             "environment": environment,
-            "supported_auth_profiles": [AUTH_PROFILE_BOOTSTRAP_MTLS, AUTH_PROFILE_TOKEN_AUTH]
+            "supported_auth_profiles": rollout.profiles(),
+            "mtls_ready": rollout.ready,
+            "current_auth_profile": rollout.current_profile()
         }))
         .send()
         .await
@@ -234,6 +237,7 @@ async fn external_worker_bootstrap() -> Result<(
             source: None,
         });
     }
+    rollout.accept(&authority.auth_profile)?;
     match authority.auth_profile.as_str() {
         AUTH_PROFILE_BOOTSTRAP_MTLS => {
             if authority.identity_endpoint.trim().is_empty() {

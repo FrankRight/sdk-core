@@ -478,6 +478,130 @@ fn validate_session(session: &Session, authority: &Authority) -> Result<()> {
     Ok(())
 }
 
+const AUTH_PROFILE_FILE: &str = "worker-auth-profile";
+
+pub(crate) struct RolloutReadiness {
+    pub(crate) ready: bool,
+    pub(crate) pinned: bool,
+    directory: PathBuf,
+}
+
+impl RolloutReadiness {
+    pub(crate) fn from_env() -> Result<Self> {
+        Self::prepare(
+            &std::env::var("AGNT5_WORKER_MTLS_ENABLED").unwrap_or_default(),
+            &std::env::var("AGNT5_WORKER_SESSION_DIR").unwrap_or_default(),
+        )
+    }
+
+    fn prepare(enabled: &str, directory: &str) -> Result<Self> {
+        let opted_in = match enabled.trim() {
+            "" | "false" => false,
+            "true" => true,
+            _ => {
+                return Err(connection_error(
+                    "AGNT5_WORKER_MTLS_ENABLED must be true or false",
+                ))
+            }
+        };
+        let directory = PathBuf::from(directory.trim());
+        let mut pinned = false;
+        if !directory.as_os_str().is_empty() {
+            for name in [AUTH_PROFILE_FILE, SESSION_FILE_NAME] {
+                let path = directory.join(name);
+                match std::fs::symlink_metadata(&path) {
+                    Ok(_) => {
+                        ensure_private_session_file(&path)?;
+                        if name == AUTH_PROFILE_FILE {
+                            let value = std::fs::read_to_string(&path).map_err(|e| {
+                                connection_error(format!("read worker auth profile: {e}"))
+                            })?;
+                            if value != "bootstrap-mtls" {
+                                return Err(connection_error(
+                                    "invalid persisted worker auth profile",
+                                ));
+                            }
+                        }
+                        pinned = true;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        return Err(connection_error(format!(
+                            "inspect worker identity state: {e}"
+                        )))
+                    }
+                }
+            }
+        }
+        let ready = opted_in || pinned;
+        if ready {
+            if directory.as_os_str().is_empty() {
+                return Err(connection_error(
+                    "AGNT5_WORKER_SESSION_DIR is required for mTLS readiness",
+                ));
+            }
+            ensure_private_directory(&directory)?;
+            let probe = directory.join(format!(".worker-readiness-{}", uuid::Uuid::new_v4()));
+            write_private_file(&probe, b"")?;
+            std::fs::remove_file(probe)
+                .map_err(|e| connection_error(format!("remove worker readiness probe: {e}")))?;
+        }
+        Ok(Self {
+            ready,
+            pinned,
+            directory,
+        })
+    }
+
+    pub(crate) fn profiles(&self) -> Vec<&'static str> {
+        if self.pinned {
+            vec!["bootstrap-mtls"]
+        } else if self.ready {
+            vec!["bootstrap-mtls", "token-auth"]
+        } else {
+            vec!["token-auth"]
+        }
+    }
+
+    pub(crate) fn current_profile(&self) -> &'static str {
+        if self.pinned {
+            "bootstrap-mtls"
+        } else {
+            ""
+        }
+    }
+
+    pub(crate) fn accept(&self, profile: &str) -> Result<()> {
+        if profile == "token-auth" {
+            return if self.pinned {
+                Err(connection_error(
+                    "refusing to downgrade an enrolled mTLS worker to token-auth",
+                ))
+            } else {
+                Ok(())
+            };
+        }
+        if profile != "bootstrap-mtls" || !self.ready {
+            return Err(connection_error(
+                "discovery selected an authentication profile the worker is not ready to use",
+            ));
+        }
+        // Persist selection before enrollment so retries and process restarts
+        // cannot turn a failed enrollment into an implicit bearer fallback.
+        let temporary = self
+            .directory
+            .join(format!(".worker-auth-profile-{}", uuid::Uuid::new_v4()));
+        write_private_file(&temporary, b"bootstrap-mtls")?;
+        if let Err(error) = std::fs::rename(&temporary, self.directory.join(AUTH_PROFILE_FILE)) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(connection_error(format!(
+                "persist worker auth profile: {error}"
+            )));
+        }
+        sync_directory(&self.directory)
+    }
+}
+
 fn load_session(path: &Path, authority: &Authority) -> Result<Session> {
     ensure_private_session_file(path)?;
     let bytes = std::fs::read(path)
@@ -611,6 +735,37 @@ fn connection_error(message: impl Into<String>) -> SdkError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rolling_opt_in_survives_restart_and_prevents_downgrade() {
+        let legacy = RolloutReadiness::prepare("", "").unwrap();
+        assert_eq!(legacy.profiles(), vec!["token-auth"]);
+        assert!(legacy.accept("bootstrap-mtls").is_err());
+        assert!(legacy.accept("token-auth").is_ok());
+        assert!(RolloutReadiness::prepare("true", "").is_err());
+        assert!(RolloutReadiness::prepare("typo", "").is_err());
+        let dir = tempfile::tempdir().unwrap();
+        let directory = dir.path().to_str().unwrap();
+        let ready = RolloutReadiness::prepare("true", directory).unwrap();
+        assert!(ready.ready && !ready.pinned);
+        ready.accept("bootstrap-mtls").unwrap();
+        let restarted = RolloutReadiness::prepare("false", directory).unwrap();
+        assert!(restarted.ready && restarted.pinned);
+        assert_eq!(restarted.profiles(), vec!["bootstrap-mtls"]);
+        assert_eq!(restarted.current_profile(), "bootstrap-mtls");
+        assert!(restarted.accept("token-auth").is_err());
+        std::fs::write(dir.path().join(AUTH_PROFILE_FILE), b"corrupt").unwrap();
+        assert!(RolloutReadiness::prepare("", directory).is_err());
+    }
+
+    #[test]
+    fn existing_session_pins_even_without_rollout_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        write_private_file(&dir.path().join(SESSION_FILE_NAME), b"old SDK session").unwrap();
+        let ready = RolloutReadiness::prepare("", dir.path().to_str().unwrap()).unwrap();
+        assert!(ready.ready && ready.pinned);
+        assert!(ready.accept("token-auth").is_err());
+    }
 
     fn authority() -> Authority {
         Authority {
