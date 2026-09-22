@@ -6041,6 +6041,12 @@ impl Worker {
                     return;
                 }
             };
+            // The certificate identity can replace the configured random ID.
+            // Bind the entire parked context before registration so lifecycle,
+            // activation, renewal and completion carry the same authority as
+            // PollJob. Rewriting only RPC envelopes leaves handler-emitted
+            // journal records fenced against the wrong worker.
+            let worker_id = client.effective_worker_id(&worker_id).to_string();
             let registration = ParkedWorkerSessionRegistration {
                 worker_id: worker_id.clone(),
                 project_id: project_id.clone(),

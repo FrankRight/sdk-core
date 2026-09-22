@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.3 - 2026-09-22
+
+### Fixed
+
+- Propagate the certificate-assigned worker ID into pull execution, lifecycle checkpoints, and activation authority. This fixes `authority_stale` failures when opt-in mTLS workers execute tasks; bearer workers keep their configured ID.
+
 ## 0.3.2 - 2026-09-22
 
 ### Added
