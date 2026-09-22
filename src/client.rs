@@ -1316,6 +1316,8 @@ pub struct EngineClient {
     clients: Vec<EngineServiceClient<AuthenticatedChannel>>,
     next: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     authoritative_worker_id: Option<String>,
+    identity_authorization: Option<Arc<RwLock<Option<MetadataValue<tonic::metadata::Ascii>>>>>,
+    endpoint: String,
 }
 
 impl EngineClient {
@@ -1387,14 +1389,28 @@ impl EngineClient {
         Ok(Self {
             clients,
             next: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            identity_authorization: authoritative_worker_id
+                .as_ref()
+                .map(|_| interceptor.token.clone()),
             authoritative_worker_id,
+            endpoint,
         })
     }
 
     /// Get the next client from the pool (round-robin).
-    fn next_client(&mut self) -> &mut EngineServiceClient<AuthenticatedChannel> {
+    async fn next_client(&mut self) -> Result<&mut EngineServiceClient<AuthenticatedChannel>> {
+        // Bindings can retain an engine client across worker reconnections.
+        // A renewed certificate needs a new TLS pool; never reuse the old
+        // channel or attach its successor's token to the old certificate.
+        if self
+            .identity_authorization
+            .as_ref()
+            .is_some_and(|token| token.read().unwrap_or_else(|p| p.into_inner()).is_none())
+        {
+            *self = Self::connect(&self.endpoint).await?;
+        }
         let idx = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.clients.len();
-        &mut self.clients[idx]
+        Ok(&mut self.clients[idx])
     }
 
     /// Admit one logical activation and return the journal-authoritative decision.
@@ -1404,7 +1420,12 @@ impl EngineClient {
     ) -> Result<BeginActivationResponse> {
         let mut timer = crate::core_metrics::RpcTimer::new(&request.run_id, "begin");
         for attempt in 0..ENGINE_ACTIVATION_RPC_ATTEMPTS {
-            match self.next_client().begin_activation(request.clone()).await {
+            match self
+                .next_client()
+                .await?
+                .begin_activation(request.clone())
+                .await
+            {
                 Ok(response) => {
                     let response = response.into_inner();
                     timer.outcome(match response.outcome {
@@ -1443,6 +1464,7 @@ impl EngineClient {
         for attempt in 0..ENGINE_ACTIVATION_RPC_ATTEMPTS {
             match self
                 .next_client()
+                .await?
                 .complete_activation(request.clone())
                 .await
             {
@@ -1483,7 +1505,12 @@ impl EngineClient {
     ) -> Result<FailActivationResponse> {
         let mut timer = crate::core_metrics::RpcTimer::new(&request.run_id, "fail");
         for attempt in 0..ENGINE_ACTIVATION_RPC_ATTEMPTS {
-            match self.next_client().fail_activation(request.clone()).await {
+            match self
+                .next_client()
+                .await?
+                .fail_activation(request.clone())
+                .await
+            {
                 Ok(response) => {
                     let response = response.into_inner();
                     timer.outcome(if response.accepted {
@@ -1517,7 +1544,12 @@ impl EngineClient {
         request: SuspendActivationRequest,
     ) -> Result<SuspendActivationResponse> {
         for attempt in 0..ENGINE_ACTIVATION_RPC_ATTEMPTS {
-            match self.next_client().suspend_activation(request.clone()).await {
+            match self
+                .next_client()
+                .await?
+                .suspend_activation(request.clone())
+                .await
+            {
                 Ok(response) => return Ok(response.into_inner()),
                 Err(status) if should_retry_activation_status(&status, attempt) => {
                     debug!(
@@ -1538,6 +1570,7 @@ impl EngineClient {
         for attempt in 0..ENGINE_RPC_RETRY_ATTEMPTS {
             match self
                 .next_client()
+                .await?
                 .append(AppendRequest {
                     record: Some(record.clone()),
                 })
@@ -1576,6 +1609,7 @@ impl EngineClient {
         for attempt in 0..ENGINE_RPC_RETRY_ATTEMPTS {
             match self
                 .next_client()
+                .await?
                 .append_batch(AppendBatchRequest {
                     records: records.clone(),
                 })
@@ -1622,6 +1656,7 @@ impl EngineClient {
         let expected = events.len() as i64;
         let response = self
             .next_client()
+            .await?
             .event_stream(tokio_stream::iter(events))
             .await
             .map_err(|status| SdkError::Connection {
@@ -1837,11 +1872,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retired_engine_identity_reconnects_before_using_cached_channels() {
+        let mut client = EngineClient {
+            // If stale clients are selected, the empty pool makes this fail.
+            clients: Vec::new(),
+            next: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            authoritative_worker_id: Some("worker".into()),
+            identity_authorization: Some(Arc::new(RwLock::new(None))),
+            endpoint: "invalid endpoint".into(),
+        };
+        let error = client.next_client().await.unwrap_err();
+        assert!(error.to_string().contains("Invalid engine endpoint"));
+        assert_eq!(client.next.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
     async fn append_batch_rejects_multi_run_before_retry_or_rpc() {
         let mut client = EngineClient {
             clients: Vec::new(),
             next: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             authoritative_worker_id: None,
+            identity_authorization: None,
+            endpoint: "http://127.0.0.1:1".into(),
         };
         let records = vec![
             Record {
