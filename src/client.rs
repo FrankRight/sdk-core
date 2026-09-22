@@ -489,6 +489,25 @@ pub struct WorkerCoordinatorClient {
     negotiated_protocol_capabilities: Arc<RwLock<Vec<String>>>,
     authoritative_worker_id: Option<String>,
     external_worker_authority: Option<ExternalWorkerAuthority>,
+    identity_authorization: Option<Arc<RwLock<Option<MetadataValue<tonic::metadata::Ascii>>>>>,
+}
+
+async fn wait_for_identity_rotation(
+    authorization: Option<&Arc<RwLock<Option<MetadataValue<tonic::metadata::Ascii>>>>>,
+) {
+    let Some(authorization) = authorization else {
+        return std::future::pending().await;
+    };
+    loop {
+        if authorization
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_none()
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 const WORKER_COORDINATOR_RPC_TIMEOUT: Duration = Duration::from_secs(45);
@@ -550,6 +569,9 @@ impl WorkerCoordinatorClient {
 
         let client =
             WorkerCoordinatorServiceClient::with_interceptor(channel.clone(), interceptor.clone());
+        let identity_authorization = authoritative_worker_id
+            .as_ref()
+            .map(|_| interceptor.token.clone());
         let engine_client = EngineServiceClient::with_interceptor(channel, interceptor);
 
         Ok(Self {
@@ -558,7 +580,14 @@ impl WorkerCoordinatorClient {
             negotiated_protocol_capabilities: Arc::new(RwLock::new(Vec::new())),
             authoritative_worker_id,
             external_worker_authority,
+            identity_authorization,
         })
+    }
+
+    /// Rotation invalidates the old certificate-bound token. Pull workers have
+    /// no dispatch stream to close, so observe that invalidation explicitly.
+    pub(crate) async fn wait_for_identity_rotation(&self) {
+        wait_for_identity_rotation(self.identity_authorization.as_ref()).await;
     }
 
     /// Apply the project-bound authority returned by external worker discovery.
@@ -1647,6 +1676,41 @@ pub fn build_engine_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn identity_rotation_wakes_connection_loop_only_after_invalidation() {
+        let token = Arc::new(RwLock::new(Some(bearer_metadata("first").unwrap())));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), wait_for_identity_rotation(None))
+                .await
+                .is_err()
+        );
+        assert!(tokio::time::timeout(
+            Duration::from_millis(10),
+            wait_for_identity_rotation(Some(&token))
+        )
+        .await
+        .is_err());
+        // Refresh on the same certificate must not restart a worker.
+        *token.write().unwrap() = Some(bearer_metadata("refreshed").unwrap());
+        assert!(tokio::time::timeout(
+            Duration::from_millis(10),
+            wait_for_identity_rotation(Some(&token))
+        )
+        .await
+        .is_err());
+        let rotated = wait_for_identity_rotation(Some(&token));
+        tokio::pin!(rotated);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut rotated)
+                .await
+                .is_err()
+        );
+        *token.write().unwrap() = None;
+        tokio::time::timeout(Duration::from_secs(1), rotated)
+            .await
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn https_channel_enables_tls_without_an_explicit_client_config() {

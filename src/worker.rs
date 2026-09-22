@@ -4904,6 +4904,19 @@ impl Worker {
                 break Ok(());
             }
             tokio::select! {
+                _ = client.wait_for_identity_rotation() => {
+                    revoke_active_pull_slots(
+                        &self.slot_phases,
+                        &self.revoked_executions,
+                        &self.cancel_tokens,
+                        &self.cancel_hook,
+                    );
+                    break Err(SdkError::Connection {
+                        message: "worker certificate rotated; reconnecting with replacement identity".to_string(),
+                        code: crate::error::ErrorCode::ConnectionFailed,
+                        source: None,
+                    });
+                }
                 // Dispatch incoming messages to worker pool
                 result = rx.recv_async() => {
                     match result {
