@@ -270,12 +270,6 @@ async fn external_worker_bootstrap() -> Result<(
         initial.expires_at,
     );
 
-    // Discovery is authoritative. These values are consumed immediately after
-    // connect when the pull session registration is constructed.
-    std::env::set_var("AGNT5_PROJECT_ID", &bootstrap.authority.project_id);
-    std::env::set_var("AGNT5_DEPLOYMENT_ID", &bootstrap.authority.deployment_id);
-    std::env::set_var("AGNT5_WORKERPOOL_ID", &bootstrap.authority.worker_pool_id);
-    std::env::set_var("AGNT5_WORKER_MODE", "pull");
     eprintln!("[INFO] worker authenticated with token auth");
     eprintln!(
         "[INFO] discovered runtime endpoint ({})",
@@ -575,6 +569,10 @@ impl WorkerCoordinatorClient {
             return;
         };
         authority.apply_to_metadata(metadata);
+    }
+
+    pub(crate) fn is_external_worker(&self) -> bool {
+        self.external_worker_authority.is_some()
     }
 
     /// Use the server-assigned ID for certificate-bound customer workers.

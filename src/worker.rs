@@ -822,6 +822,14 @@ impl WorkerConfig {
     }
 }
 
+fn connected_worker_mode(value: Option<&str>, external_worker: bool) -> WorkerMode {
+    if external_worker {
+        WorkerMode::Pull
+    } else {
+        resolve_worker_mode(value)
+    }
+}
+
 fn resolve_worker_mode(value: Option<&str>) -> WorkerMode {
     match value {
         None | Some("") | Some("pull") | Some("PULL") => WorkerMode::Pull,
@@ -4652,7 +4660,10 @@ impl Worker {
         // `AGNT5_WORKER_MODE=pull` now means parked long-poll assignment
         // (`RegisterWorkerSession` + `PollJob`). The legacy batch `PollJobs`
         // loop is intentionally gone.
-        let mode = resolve_worker_mode(std::env::var("AGNT5_WORKER_MODE").ok().as_deref());
+        let mode = connected_worker_mode(
+            std::env::var("AGNT5_WORKER_MODE").ok().as_deref(),
+            client.is_external_worker(),
+        );
         let is_pull_mode = mode == WorkerMode::Pull;
         metadata.insert(
             "AGNT5_WORKER_MODE".to_string(),
@@ -6458,6 +6469,18 @@ mod tests {
             }
             other => panic!("expected typed timeout error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn external_discovery_selects_pull_without_changing_local_worker_mode() {
+        for value in [None, Some("pull"), Some("push")] {
+            assert_eq!(super::connected_worker_mode(value, true), WorkerMode::Pull);
+        }
+        assert_eq!(
+            super::connected_worker_mode(Some("push"), false),
+            WorkerMode::Push
+        );
+        assert_eq!(super::connected_worker_mode(None, false), WorkerMode::Pull);
     }
 
     #[test]
